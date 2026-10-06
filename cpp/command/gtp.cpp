@@ -83,6 +83,8 @@ static const vector<string> knownCommands = {
 
   //Display raw neural net evaluations
   "kata-raw-nn",
+  //Same, for many positions at once, evaluated in parallel so that the neural net can batch them
+  "kata-raw-nn-batch",
 
   //Misc other stuff
   "cputime",
@@ -99,6 +101,63 @@ static const vector<string> knownCommands = {
 
 static bool tryParseLoc(const string& s, const Board& b, Loc& loc) {
   return Location::tryOfString(s,b,loc);
+}
+
+//Parse a sequence of <COLOR> <VERTEX> pairs, as in set_position.
+//Returns false and sets error if it could not be parsed.
+static bool tryParseStonePairs(const vector<string>& pieces, const Board& b, vector<Move>& stones, string& error) {
+  if(pieces.size() % 2 != 0) {
+    error = "Expected a space-separated sequence of <COLOR> <VERTEX> pairs but got '" + Global::concat(pieces," ") + "'";
+    return false;
+  }
+  for(int i = 0; i<pieces.size(); i += 2) {
+    Player pla;
+    Loc loc;
+    if(!PlayerIO::tryParsePlayer(pieces[i],pla)) {
+      error = "Expected a space-separated sequence of <COLOR> <VERTEX> pairs but got '" + Global::concat(pieces," ") + "': ";
+      error += "could not parse color: '" + pieces[i] + "'";
+      return false;
+    }
+    if(!tryParseLoc(pieces[i+1],b,loc) || loc == Board::PASS_LOC) {
+      error = "Expected a space-separated sequence of <COLOR> <VERTEX> pairs but got '" + Global::concat(pieces," ") + "': ";
+      error += "Could not parse vertex: '" + pieces[i+1] + "'";
+      return false;
+    }
+    stones.push_back(Move(loc,pla));
+  }
+  return true;
+}
+
+//Print neural net output as kata-raw-nn does, without empty lines
+static void printRawNNOutput(ostream& out, const NNOutput& nnOutput, const Board& board) {
+  out << "whiteWin " << Global::strprintf("%.6f",nnOutput.whiteWinProb) << endl;
+  out << "whiteLoss " << Global::strprintf("%.6f",nnOutput.whiteLossProb) << endl;
+  out << "noResult " << Global::strprintf("%.6f",nnOutput.whiteNoResultProb) << endl;
+  out << "varTimeLeft " << Global::strprintf("%.3f",nnOutput.varTimeLeft) << endl;
+  out << "shorttermWinlossError " << Global::strprintf("%.3f",nnOutput.shorttermWinlossError) << endl;
+
+  out << "policy" << endl;
+  for(int y = 0; y<board.y_size; y++) {
+    for(int x = 0; x<board.x_size; x++) {
+      int pos = NNPos::xyToPos(x,y,nnOutput.nnXLen);
+      float prob = nnOutput.policyProbs[pos];
+      if(prob < 0)
+        out << "    NAN ";
+      else
+        out << Global::strprintf("%8.6f ", prob);
+    }
+    out << endl;
+  }
+  out << "policyPass ";
+  {
+    int pos = NNPos::locToPos(Board::PASS_LOC,board.x_size,nnOutput.nnXLen,nnOutput.nnYLen);
+    float prob = nnOutput.policyProbs[pos];
+    if(prob < 0)
+      out << "    NAN "; // Probably shouldn't ever happen for pass unles the rules change, but we handle it anyways
+    else
+      out << Global::strprintf("%8.6f ", prob);
+    out << endl;
+  }
 }
 
 //Filter out all double newlines, since double newline terminates GTP command responses
@@ -939,40 +998,76 @@ struct GTPEngine {
 
         NNOutput* nnOutput = buf.result.get();
         out << "symmetry " << symmetry << endl;
-        out << "whiteWin " << Global::strprintf("%.6f",nnOutput->whiteWinProb) << endl;
-        out << "whiteLoss " << Global::strprintf("%.6f",nnOutput->whiteLossProb) << endl;
-        out << "noResult " << Global::strprintf("%.6f",nnOutput->whiteNoResultProb) << endl;
-        out << "varTimeLeft " << Global::strprintf("%.3f",nnOutput->varTimeLeft) << endl;
-        out << "shorttermWinlossError " << Global::strprintf("%.3f",nnOutput->shorttermWinlossError) << endl;
-
-        out << "policy" << endl;
-        for(int y = 0; y<board.y_size; y++) {
-          for(int x = 0; x<board.x_size; x++) {
-            int pos = NNPos::xyToPos(x,y,nnOutput->nnXLen);
-            float prob = nnOutput->policyProbs[pos];
-            if(prob < 0)
-              out << "    NAN ";
-            else
-              out << Global::strprintf("%8.6f ", prob);
-          }
-          out << endl;
-        }
-        out << "policyPass ";
-        {
-          int pos = NNPos::locToPos(Board::PASS_LOC,board.x_size,nnOutput->nnXLen,nnOutput->nnYLen);
-          float prob = nnOutput->policyProbs[pos];
-          if(prob < 0)
-            out << "    NAN "; // Probably shouldn't ever happen for pass unles the rules change, but we handle it anyways
-          else
-            out << Global::strprintf("%8.6f ", prob);
-          out << endl;
-        }
+        printRawNNOutput(out,*nnOutput,board);
 
         out << endl;
       }
     }
 
     return Global::trim(out.str());
+  }
+
+  //Raw neural net evaluation of many positions, with black to play, on current board size.
+  //Positions are evaluated from multiple threads so that the neural net evaluates them in batches.
+  //Returns false and sets response to the error if a position is illegal.
+  bool rawNNBatch(const vector<vector<Move>>& positions, int symmetry, string& response) {
+    if(nnEval == NULL) {
+      response = "";
+      return true;
+    }
+
+    const int xSize = bot->getRootBoard().x_size;
+    const int ySize = bot->getRootBoard().y_size;
+    const Player nextPla = P_BLACK;
+    vector<Board> boards;
+    vector<BoardHistory> hists;
+
+    for(int i = 0; i<positions.size(); i++) {
+      Board board(xSize,ySize);
+      if(!board.setStones(positions[i])) {
+        response = "position " + Global::intToString(i) + ": Illegal stone placements - overlapping stones?";
+        return false;
+      }
+      BoardHistory hist(board,nextPla,currentRules);
+      hist.setInitialTurnNumber(board.numStonesOnBoard()); //Same heuristic as setPosition
+      boards.push_back(board);
+      hists.push_back(hist);
+    }
+
+    MiscNNInputParams nnInputParams;
+    nnInputParams.playoutDoublingAdvantage =
+      (params.playoutDoublingAdvantagePla == C_EMPTY || params.playoutDoublingAdvantagePla == nextPla) ?
+      staticPlayoutDoublingAdvantage : -staticPlayoutDoublingAdvantage;
+    nnInputParams.symmetry = symmetry;
+
+    vector<shared_ptr<NNOutput>> results(positions.size());
+    std::atomic<int> nextIdx(0);
+    auto evaluateLoop = [&]() {
+      int i;
+      while((i = nextIdx.fetch_add(1)) < (int)positions.size()) {
+        NNResultBuf buf;
+        bool skipCache = true;
+        nnEval->evaluate(boards[i],hists[i],nextPla,nnInputParams,buf,skipCache);
+        results[i] = buf.result;
+      }
+    };
+
+    //Enough concurrent evaluations to fill batches on every gpu
+    int numThreads = std::min((int)positions.size(), nnEval->getMaxBatchSize() * nnEval->getNumGpus());
+    vector<std::thread> threads;
+    for(int t = 0; t<numThreads; t++)
+      threads.push_back(std::thread(evaluateLoop));
+    for(int t = 0; t<numThreads; t++)
+      threads[t].join();
+
+    ostringstream out;
+    for(int i = 0; i<positions.size(); i++) {
+      out << "position " << i << endl;
+      printRawNNOutput(out,*results[i],boards[i]);
+    }
+
+    response = Global::trim(out.str());
+    return true;
   }
 
   SearchParams getParams() {
@@ -1963,43 +2058,19 @@ int MainCmds::gtp(const vector<string>& args) {
     }
 
     else if(command == "set_position") {
-      if(pieces.size() % 2 != 0) {
+      vector<Move> initialStones;
+      string error;
+      if(!tryParseStonePairs(pieces,engine->bot->getRootBoard(),initialStones,error)) {
         responseIsError = true;
-        response = "Expected a space-separated sequence of <COLOR> <VERTEX> pairs but got '" + Global::concat(pieces," ") + "'";
+        response = error;
       }
       else {
-        vector<Move> initialStones;
-        for(int i = 0; i<pieces.size(); i += 2) {
-          Player pla;
-          Loc loc;
-          if(!PlayerIO::tryParsePlayer(pieces[i],pla)) {
-            responseIsError = true;
-            response = "Expected a space-separated sequence of <COLOR> <VERTEX> pairs but got '" + Global::concat(pieces," ") + "': ";
-            response += "could not parse color: '" + pieces[0] + "'";
-            break;
-          }
-          else if(!tryParseLoc(pieces[i+1],engine->bot->getRootBoard(),loc)) {
-            responseIsError = true;
-            response = "Expected a space-separated sequence of <COLOR> <VERTEX> pairs but got '" + Global::concat(pieces," ") + "': ";
-            response += "Could not parse vertex: '" + pieces[1] + "'";
-            break;
-          }
-          else if(loc == Board::PASS_LOC) {
-            responseIsError = true;
-            response = "Expected a space-separated sequence of <COLOR> <VERTEX> pairs but got '" + Global::concat(pieces," ") + "': ";
-            response += "Could not parse vertex: '" + pieces[1] + "'";
-            break;
-          }
-          initialStones.push_back(Move(loc,pla));
+        bool suc = engine->setPosition(initialStones);
+        if(!suc) {
+          responseIsError = true;
+          response = "Illegal stone placements - overlapping stones or stones with no liberties?";
         }
-        if(!responseIsError) {
-          bool suc = engine->setPosition(initialStones);
-          if(!suc) {
-            responseIsError = true;
-            response = "Illegal stone placements - overlapping stones or stones with no liberties?";
-          }
-          maybeStartPondering = false;
-        }
+        maybeStartPondering = false;
       }
     }
 
@@ -2267,6 +2338,42 @@ int MainCmds::gtp(const vector<string>& args) {
       }
       else {
         response = engine->rawNN(whichSymmetry);
+      }
+    }
+
+    else if(command == "kata-raw-nn-batch") {
+      //kata-raw-nn-batch <symmetry> <pos> | <pos> | ...
+      //where each <pos> is a sequence of <COLOR> <VERTEX> pairs as in set_position, possibly empty.
+      int whichSymmetry = 0;
+      if(pieces.size() < 1 ||
+         !Global::tryStringToInt(pieces[0],whichSymmetry) ||
+         whichSymmetry < 0 || whichSymmetry > SymmetryHelpers::NUM_SYMMETRIES-1) {
+        responseIsError = true;
+        response = "Expected symmetry index [0-7] then positions separated by '|' for kata-raw-nn-batch but got '" + Global::concat(pieces," ") + "'";
+      }
+      else {
+        vector<vector<Move>> positions;
+        vector<string> positionPieces;
+        for(int i = 1; i<=pieces.size() && !responseIsError; i++) {
+          //Empty pieces come from consecutive spaces, i.e around an empty position
+          if(i < pieces.size() && pieces[i].empty())
+            continue;
+          if(i < pieces.size() && pieces[i] != "|") {
+            positionPieces.push_back(pieces[i]);
+            continue;
+          }
+          vector<Move> stones;
+          string error;
+          if(!tryParseStonePairs(positionPieces,engine->bot->getRootBoard(),stones,error)) {
+            responseIsError = true;
+            response = "position " + Global::intToString((int)positions.size()) + ": " + error;
+          }
+          positions.push_back(stones);
+          positionPieces.clear();
+        }
+
+        if(!responseIsError)
+          responseIsError = !engine->rawNNBatch(positions,whichSymmetry,response);
       }
     }
 

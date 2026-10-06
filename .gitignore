@@ -6,6 +6,7 @@
 tmp*.txt
 LinuxCompile*/
 
+/build
 cpp/build
 cpp/build_trt
 cpp/build_cuda

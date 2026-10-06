@@ -170,6 +170,13 @@ In addition to a basic set of [GTP commands](https://www.lysator.liu.se/~gunnar/
      whiteOwnership (boardXSize * boardYSize floats) - predicted ownership by white (from -1 to 1).
      ```
      Any consumers of this data should attempt to be robust to any pattern of whitespace within the output, as well as possibly the future addition of new keys and values. The ordering of the keys is also not guaranteed - consumers should be capable of handling any permutation of them.
+  * `kata-raw-nn-batch SYMMETRY POSITION | POSITION | ...`
+     * `SYMMETRY` should be an integer from 0-7.
+     * Each `POSITION` is a possibly empty sequence of `<COLOR> <VERTEX>` pairs, as in `set_position`. Positions are separated by `|`, so `kata-raw-nn-batch 0 | black a1 white b2` evaluates the empty board, then a position with two stones.
+     * Positions use the current board size, with black to play, and do not change the current position.
+     * Reports the raw neural net evaluation of each position, evaluated in parallel so that the neural net processes them in batches of up to `nnMaxBatchSize`. Batched evaluations may differ very slightly from `kata-raw-nn` (i.e due to FP16 computations).
+     * Output is, for each position in order, `position <index>` followed by the same keys as `kata-raw-nn`, without empty lines.
+     * If a position cannot be parsed or is illegal, responds with an error `position <index>: ...` and nothing is evaluated.
   * `kata-get-param PARAM`, `kata-set-param PARAM VALUE`
      * Get a parameter or set a parameter to a given value.
      * Current supported PARAMs are:
