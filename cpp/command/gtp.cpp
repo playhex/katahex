@@ -336,8 +336,38 @@ struct GTPEngine {
 
   //Specify -1 for the sizes for a default
   void setOrResetBoardSize(ConfigParser& cfg, Logger& logger, Rand& seedRand, int boardXSize, int boardYSize, bool loggingToStderr) {
-    if(nnEval != NULL && boardXSize == nnEval->getNNXLen() && boardYSize == nnEval->getNNYLen())
+    bool wasDefault = false;
+    if(boardXSize == -1 || boardYSize == -1) {
+      boardXSize = Board::DEFAULT_LEN;
+      boardYSize = Board::DEFAULT_LEN;
+      wasDefault = true;
+    }
+
+    //Neural net size: board size, or at least gtpMinNNSize so that smaller boards share the same net
+    //without reinitializing it, or max size if gtpDebugForceMaxNNSize.
+    const int minNNSize = cfg.contains("gtpMinNNSize") ? cfg.getInt("gtpMinNNSize", 0, Board::MAX_LEN) : 0;
+    const bool forceMaxNNSize = cfg.contains("gtpDebugForceMaxNNSize") && cfg.getBool("gtpDebugForceMaxNNSize");
+    bool defaultRequireExactNNLen = true;
+    int nnLenX = std::max(boardXSize, minNNSize);
+    int nnLenY = std::max(boardYSize, minNNSize);
+    if(minNNSize > 0)
+      defaultRequireExactNNLen = false;
+    if(forceMaxNNSize) {
+      defaultRequireExactNNLen = false;
+      nnLenX = Board::MAX_LEN;
+      nnLenY = Board::MAX_LEN;
+    }
+
+    //Neural net already has the wanted size, only reset the board to the new size
+    if(nnEval != NULL && nnLenX == nnEval->getNNXLen() && nnLenY == nnEval->getNNYLen()) {
+      logger.write(
+        "Reusing neural net with nnXLen " + Global::intToString(nnEval->getNNXLen()) + " nnYLen " + Global::intToString(nnEval->getNNYLen())
+        + " for board " + Global::intToString(boardXSize) + "x" + Global::intToString(boardYSize)
+      );
+      resetBoard(boardXSize, boardYSize);
       return;
+    }
+
     if(nnEval != NULL) {
       assert(bot != NULL);
       bot->stopAndWait();
@@ -348,25 +378,9 @@ struct GTPEngine {
       logger.write("Cleaned up old neural net and bot");
     }
 
-    bool wasDefault = false;
-    if(boardXSize == -1 || boardYSize == -1) {
-      boardXSize = Board::DEFAULT_LEN;
-      boardYSize = Board::DEFAULT_LEN;
-      wasDefault = true;
-    }
-
     const int maxConcurrentEvals = params.numThreads * 2 + 16; // * 2 + 16 just to give plenty of headroom
     const int expectedConcurrentEvals = params.numThreads;
     const int defaultMaxBatchSize = std::max(8,((params.numThreads+3)/4)*4);
-    bool defaultRequireExactNNLen = true;
-    int nnLenX = boardXSize;
-    int nnLenY = boardYSize;
-    
-    if(cfg.contains("gtpDebugForceMaxNNSize") && cfg.getBool("gtpDebugForceMaxNNSize")) {
-      defaultRequireExactNNLen = false;
-      nnLenX = Board::MAX_LEN;
-      nnLenY = Board::MAX_LEN;
-    }
     const bool disableFP16 = false;
     const string expectedSha256 = "";
     nnEval = Setup::initializeNNEvaluator(
@@ -386,9 +400,10 @@ struct GTPEngine {
 
     //On default setup, also override board size to whatever the neural net was initialized with
     //So that if the net was initalized smaller, we don't fail with a big board
+    //Do not make it bigger if the neural net is bigger than the board (gtpMinNNSize)
     if(wasDefault) {
-      boardXSize = nnEval->getNNXLen();
-      boardYSize = nnEval->getNNYLen();
+      boardXSize = std::min(boardXSize, nnEval->getNNXLen());
+      boardYSize = std::min(boardYSize, nnEval->getNNYLen());
     }
     logger.write("Initializing board with boardXSize " + Global::intToString(boardXSize) + " boardYSize " + Global::intToString(boardYSize));
     if(!loggingToStderr)
@@ -403,6 +418,11 @@ struct GTPEngine {
     bot = new AsyncBot(params, nnEval, &logger, searchRandSeed);
     bot->setCopyOfExternalPatternBonusTable(patternBonusTable);
 
+    resetBoard(boardXSize, boardYSize);
+  }
+
+  //Empty board of given size, black to play
+  void resetBoard(int boardXSize, int boardYSize) {
     Board board(boardXSize,boardYSize);
     Player pla = P_BLACK;
     BoardHistory hist(board,pla,currentRules);
